@@ -1,0 +1,65 @@
+{
+  "manifest_version": 3,
+  "name": "Study Pomodoro (Options + Selector Rules)",
+  "version": "0.4.6",
+  "description": "Pomodoro HUD for problem sites with draggable timer, activity tracking, history, window snap, and selector-configurable solve detection.",
+  "permissions": [
+    "storage",
+    "alarms",
+    "notifications",
+    "tabs",
+    "windows",
+    "system.display"
+  ],
+  "background": {
+    "service_worker": "sw.js",
+    "type": "module"
+  },
+  "icons": {
+    "128": "icon128.png"
+  },
+  "options_page": "options.html",
+  "content_scripts": [
+    {
+      "matches": [
+        "*://*.acmicpc.net/*",
+        "*://programmers.co.kr/*",
+        "*://school.programmers.co.kr/*",
+        "*://edu.doingcoding.com/*",
+        "http://localhost:5173/*",
+        "*://edu.goorm.io/learn/lecture/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle",
+        "all_frames": true         
+    }
+  ],
+  "commands": {
+    "layout-left": {
+      "suggested_key": {
+        "default": "Alt+Shift+Left"
+      },
+      "description": "Snap window to left half"
+    },
+    "layout-right": {
+      "suggested_key": {
+        "default": "Alt+Shift+Right"
+      },
+      "description": "Snap window to right half"
+    },
+    "layout-maximize": {
+      "suggested_key": {
+        "default": "Alt+Shift+F"
+      },
+      "description": "Maximize window"
+    },
+    "toggle-panel": {
+      "suggested_key": {
+        "default": "Alt+Shift+M"
+      },
+      "description": "Toggle compact/expanded HUD"
+    }
+  }
+}
