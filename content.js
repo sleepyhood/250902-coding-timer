@@ -1,1039 +1,348 @@
-function isContextAlive() {
-  try {
-    return !!chrome?.runtime?.id;
-  } catch {
-    return false;
-  }
-}
 
-function safeGetLocal(key) {
-  return new Promise((resolve) => {
-    if (!isContextAlive()) return resolve(undefined);
+
+(function(){
+  if (window.__codingTimerInjected) return;
+  window.__codingTimerInjected = true;
+
+  // ---- guards for extension disconnect ----
+  function hasExt(){
+    return typeof chrome !== 'undefined' && chrome.runtime && typeof chrome.runtime.id === 'string';
+  }
+  function safeSendMessage(msg){
+    if (!hasExt()) return false;
+    try { chrome.runtime.sendMessage(msg); return true; } catch(e){ return false; }
+  }
+
+  // ---------- Utils ----------
+  const TWO_MIN = 2*60*1000;
+  const todayStr = () => {
+    const d = new Date();
+    const mm = String(d.getMonth()+1).padStart(2,'0');
+    const dd = String(d.getDate()).padStart(2,'0');
+    return `${d.getFullYear()}-${mm}-${dd}`;
+  };
+  const fmt = (ms) => {
+    const s = Math.floor(ms/1000);
+    const hh = String(Math.floor(s/3600)).padStart(2,'0');
+    const mm = String(Math.floor((s%3600)/60)).padStart(2,'0');
+    const ss = String(s%60).padStart(2,'0');
+    return `${hh}:${mm}:${ss}`;
+  };
+  const hash = (s) => { let h=0; for (let i=0;i<s.length;i++){ h=(h<<5)-h+s.charCodeAt(i); h|=0; } return (h>>>0).toString(36); };
+
+  // ---------- Domain rules ----------
+  const H = location.host;
+  const rules = {
+    "edu.doingcoding.com": {
+      isProblem: (url) => /^\/problem(\/|$)/.test(url.pathname),
+      isList:    (url) => !/^\/problem(\/|$)/.test(url.pathname),
+      key: (url) => `${url.host}:${url.pathname}`
+    },
+    "www.acmicpc.net": {
+      isProblem: (url) => /^\/problem\/\d+/.test(url.pathname),
+      isList:    (url) => !/^\/problem\/\d+/.test(url.pathname),
+      key: (url) => `${url.host}:${url.pathname}`
+    },
+    "acmicpc.net": {
+      isProblem: (url) => /^\/problem\/\d+/.test(url.pathname),
+      isList:    (url) => !/^\/problem\/\d+/.test(url.pathname),
+      key: (url) => `${url.host}:${url.pathname}`
+    },
+    "edu.goorm.io": {
+      isProblem: (url) => /^\/learn\/lecture\/[^/]+\/cos-pro-/.test(url.pathname),
+      isList:    (url) => !/^\/learn\/lecture\/[^/]+\/cos-pro-/.test(url.pathname),
+      key: (url) => `${url.host}:${url.pathname}`
+    },
+    "school.programmers.co.kr": {
+      isProblem: (url) => /^\/learn\/courses\/[^/]+\/lessons\/[^/]+/.test(url.pathname),
+      isList:    (url) => /^\/learn\/challenges/.test(url.pathname),
+      key: (url) => `${url.host}:${url.pathname}`
+    }
+  };
+  const getUrl = (u) => { try { return new URL(u || location.href); } catch(_) { return new URL(location.href); } };
+  const R = () => rules[H] || {
+    isProblem:(url)=>/problem|lessons/.test(url.pathname),
+    isList:(url)=>!/problem|lessons/.test(url.pathname),
+    key:(url)=>`${url.host}:${url.pathname}`
+  };
+  const getProblemKey = (u) => {
+    const url = getUrl(u), r=R();
+    return r.key(url) || `${url.host}:${url.pathname}#${hash(url.pathname)}`;
+  };
+  const getPageMode = (u) => {
+    const url=getUrl(u), r=R();
+    return r.isProblem(url) ? "problem" : (r.isList(url) ? "list" : "other");
+  };
+
+  // ---------- State ----------
+  let CURRENT_KEY = getProblemKey();
+  let MODE = getPageMode();
+  const HOSTPOS = 'ct.pos.' + location.host;
+
+  const S = {
+    running: true, lastTick: Date.now(),
+    totalMs: 0, focusMs: 0,
+    lastKeyAt: 0, lastMouseAt: 0,
+    day: todayStr(), todayTotal: 0, todayFocus: 0
+  };
+
+  // ---------- Storage ----------
+  function loadProblemAcc(key){
+    try { const raw = localStorage.getItem(`ct.acc.${key}`); return raw? JSON.parse(raw) : {totalMs:0, focusMs:0}; }
+    catch(_) { return {totalMs:0, focusMs:0}; }
+  }
+  function saveProblemAcc(key, acc){
+    try { localStorage.setItem(`ct.acc.${key}`, JSON.stringify(acc)); } catch(_) {}
+  }
+  function loadTodayTotals(){
     try {
-      chrome.storage.local.get(key, (o) => {
-        if (chrome.runtime.lastError || !isContextAlive())
-          return resolve(undefined);
-        resolve(o);
-      });
-    } catch (e) {
-      resolve(undefined);
-    }
-  });
-}
+      const raw = localStorage.getItem(`ct.day.${location.host}.${S.day}`);
+      return raw? JSON.parse(raw) : {totalMs:0, focusMs:0};
+    } catch(_) { return {totalMs:0, focusMs:0}; }
+  }
+  function saveTodayTotals(tot){
+    try { localStorage.setItem(`ct.day.${location.host}.${S.day}`, JSON.stringify(tot)); } catch(_) {}
+  }
 
-function urlInfo() {
-  const u = new URL(location.href);
-  const host = u.host;
-  const ph = (() => {
-    if (u.hash && /\/problem\//.test(u.hash)) return u.hash.replace(/^#/, "");
-    return u.pathname;
+  // init from current key/day
+  (function initFromKey(){
+    const acc = loadProblemAcc(CURRENT_KEY);
+    S.totalMs = acc.totalMs||0; S.focusMs = acc.focusMs||0;
+    const day = loadTodayTotals(); S.todayTotal = day.totalMs||0; S.todayFocus = day.focusMs||0;
   })();
-  return { u, host, path: ph.split("?")[0].replace(/\/+$/, "") };
-}
-function pageKind() {
-  const { host, path } = urlInfo();
-  if (
-    host.includes("edu.goorm.io") &&
-    /\/learn\/lecture\/[^/]+\/cos-pro-/i.test(path)
-  )
-    return "problem";
-  if (/\/problem\//.test(path)) return "problem";
-  if (host.includes("edu.goorm.io") && /\/learn\/lecture\//.test(path))
-    return "lecture";
-  return "other";
-}
-function getProblemKey() {
-  const { host, path } = urlInfo();
-  if (pageKind() === "problem" || pageKind() === "lecture")
-    return `${host}${path}`;
-  return null;
-}
 
-const POS_KEY = "pomo.pos";
-const UI_KEY = "pomo.ui";
-const HIST_KEY = "pomo.history";
-const OPT_KEY = "pomo.options";
-const DEFAULT_OPTS = {
-  history: { maxStore: 150, maxShow: 12 },
-  detect: { rules: [] },
-};
-let OPTS = DEFAULT_OPTS;
+  // ---------- HUD in Shadow DOM ----------
+  const host = document.createElement('div');
 
-async function getSavedPos() {
-  return new Promise((r) =>
-    chrome.storage.local.get(POS_KEY, (o) => {
-      const m = o[POS_KEY] || {};
-      r(m[location.host] || null);
-    })
-  );
-}
-async function savePos(pos) {
-  return new Promise((r) =>
-    chrome.storage.local.get(POS_KEY, (o) => {
-      const m = o[POS_KEY] || {};
-      m[location.host] = pos;
-      chrome.storage.local.set({ [POS_KEY]: m }, r);
-    })
-  );
-}
-async function getUI() {
-  return new Promise((r) =>
-    chrome.storage.local.get(UI_KEY, (o) => {
-      const m = o[UI_KEY] || {};
-      r(m[location.host] || { expanded: false });
-    })
-  );
-}
-async function setUI(p) {
-  return new Promise((r) =>
-    chrome.storage.local.get(UI_KEY, (o) => {
-      const m = o[UI_KEY] || {};
-      const c = m[location.host] || { expanded: false };
-      m[location.host] = { ...c, ...p };
-      chrome.storage.local.set({ [UI_KEY]: m }, r);
-    })
-  );
-}
-
-async function getHistory() {
-  const o = await safeGetLocal(HIST_KEY);
-  return o?.[HIST_KEY]?.items || [];
-}
-async function setHistory(items) {
-  if (!isContextAlive()) return;
-  try {
-    await new Promise((r) =>
-      chrome.storage.local.set({ [HIST_KEY]: { items } }, r)
-    );
-  } catch {}
-}
-async function pushHistory(item) {
-  const it = await getHistory();
-  it.unshift(item);
-  await loadOpts();
-  await setHistory(it.slice(0, OPTS.history?.maxStore || 150));
-}
-async function removeHistoryByAt(at) {
-  const it = await getHistory();
-  await setHistory(it.filter((x) => x.at !== at));
-}
-async function loadOpts() {
-  return new Promise((r) =>
-    chrome.storage.local.get(OPT_KEY, (o) => {
-      const opt = o[OPT_KEY] || DEFAULT_OPTS;
-      const out = JSON.parse(JSON.stringify(DEFAULT_OPTS));
-      if (opt.history) Object.assign(out.history, opt.history);
-      if (opt.detect && Array.isArray(opt.detect.rules))
-        out.detect.rules = opt.detect.rules;
-      OPTS = out;
-      r(out);
-    })
-  );
-}
-chrome.storage.onChanged.addListener((ch) => {
-  if (ch[OPT_KEY]) loadOpts();
-});
-
-function deriveFocusMinutesByDifficulty() {
-  if (pageKind() !== "problem") return null;
-  const text = document.body?.innerText || "";
-  const mLv = text.match(/Lv\.\s*([1-5])/i);
-  if (mLv) {
-    const lv = parseInt(mLv[1], 10);
-    return { 1: 10, 2: 15, 3: 20, 4: 25, 5: 30 }[lv] || 25;
-  }
-  const mKo = text.match(/난이도\s*[:：]?\s*(쉬움|보통|어려움)/);
-  if (mKo) return { 쉬움: 10, 보통: 20, 어려움: 30 }[mKo[1]];
-  const mEn = text.match(/difficulty\s*[:：]?\s*(easy|medium|hard)/i);
-  if (mEn) return { easy: 10, medium: 20, hard: 30 }[mEn[1].toLowerCase()];
-  return null;
-}
-
-let mounted = false,
-  problemKey = null,
-  state = { status: "idle" },
-  prevState = null,
-  rafId = null,
-  lastHref = location.href;
-const PROD_IDLE_MS = 2 * 60 * 1000,
-  DEV_IDLE_MS = 10 * 1000;
-const idleThreshold = location.host.includes("localhost")
-  ? DEV_IDLE_MS
-  : PROD_IDLE_MS;
-let lastActiveAt = Date.now(),
-  activeMs = 0,
-  lastBeat = Date.now(),
-  heartbeatTimer = null;
-
-// === New: cooldown tracking ===
-let cooldownRemaining = 0;
-let cooldownTimerId = null;
-function startCooldownTicker(updatePauseButtonUI) {
-  if (cooldownTimerId) clearInterval(cooldownTimerId);
-  if (cooldownRemaining <= 0) return;
-  cooldownTimerId = setInterval(() => {
-    cooldownRemaining = Math.max(0, cooldownRemaining - 1000);
-    updatePauseButtonUI?.();
-    if (cooldownRemaining <= 0) {
-      clearInterval(cooldownTimerId);
-      cooldownTimerId = null;
-    }
-  }, 1000);
-}
-
-// Snackbar
-function createSnackbar(shadow) {
-  let bar = shadow.getElementById("snackbar");
-  if (bar) return bar;
-  const el = document.createElement("div");
-  el.id = "snackbar";
-  el.innerHTML = `
-<style>
-#snackbar{position:fixed;right:16px;bottom:16px;z-index:2147483647;background:rgba(30,30,30,.95);color:#fff;padding:10px 12px;border-radius:10px;box-shadow:0 6px 14px rgba(0,0,0,.25);display:flex;align-items:center;gap:8px;font:13px ui-sans-serif,system-ui}
-#snackbar .btn{background:#4f46e5;border-radius:8px;padding:6px 10px;cursor:pointer}
-#snackbar .ghost{background:rgba(255,255,255,.15)}
-#snackbar.hidden{display:none}
-</style>
-<div id="box"><span id="msg"></span><button id="act" class="btn">확인</button><button id="undo" class="btn ghost" style="display:none">되돌리기</button><button id="dismiss" class="btn ghost">닫기</button></div>`;
-  shadow.appendChild(el);
-  return el;
-}
-function showConfirm(shadow, msg, onYes) {
-  const bar = createSnackbar(shadow);
-  bar.classList.remove("hidden");
-  bar.querySelector("#msg").textContent = msg;
-  bar.querySelector("#undo").style.display = "none";
-  const yes = () => {
-    onYes?.();
-    hide();
-  };
-  const hide = () => bar.classList.add("hidden");
-  const act = bar.querySelector("#act"),
-    dis = bar.querySelector("#dismiss");
-  act.textContent = "예";
-  act.onclick = yes;
-  dis.onclick = hide;
-  function key(e) {
-    if (e.key === "Enter") {
-      yes();
-      window.removeEventListener("keydown", key, true);
-    }
-  }
-  window.addEventListener("keydown", key, true);
-  setTimeout(hide, 5000);
-}
-function showUndo(shadow, msg, onUndo) {
-  const bar = createSnackbar(shadow);
-  bar.classList.remove("hidden");
-  bar.querySelector("#msg").textContent = msg;
-  const undo = bar.querySelector("#undo");
-  undo.style.display = "inline-block";
-  const hide = () => bar.classList.add("hidden");
-  bar.querySelector("#act").textContent = "확인";
-  bar.querySelector("#act").onclick = hide;
-  bar.querySelector("#dismiss").onclick = hide;
-  undo.onclick = () => {
-    onUndo?.();
-    hide();
-  };
-  setTimeout(hide, 5000);
-}
-
-// Mount
-async function mountUI(key) {
-  problemKey = key;
-  if (mounted) return;
-  mounted = true;
-  await loadOpts();
-  const uiPref = await getUI();
-  const compact = !uiPref.expanded;
-  const host = document.createElement("div");
-  host.id = "pomo-host";
-  const shadow = host.attachShadow({ mode: "open" });
-  shadow.innerHTML = `
-<style>
-:host{ all:initial }
-#wrap{
-  position:fixed; z-index:2147483647; top:16px; right:16px;
-  background:rgba(20,20,20,.92); color:#fff; padding:10px 12px; border-radius:14px;
-  overflow:hidden; font-family:ui-sans-serif,system-ui; box-shadow:0 6px 20px rgba(0,0,0,.22);
-  user-select:none; touch-action:none; --pct:0.0;
-  --c-primary:#4f46e5; --c-ghost:rgba(255,255,255,.12); --c-layout:#2563eb; --c-danger:#ef4444;
-}
-#wrap.compact .panel{display:none}
-
-#wrap:focus-within{ outline: 2px solid rgba(99,102,241,.6); outline-offset: 2px; border-radius:14px }
-
-.top{ display:flex; align-items:center; gap:10px }
-
-/* === Status pill === */
-#status{
-  display:inline-flex; align-items:center; gap:6px;
-  opacity:.9; font-size:12px; padding:4px 8px; border-radius:999px;
-  background:rgba(255,255,255,.08); min-width:72px; text-transform:uppercase;
-}
-#status .dot{width:8px;height:8px;border-radius:50%;background:#10b981}
-#status[data-state="break"] .dot{background:#22c55e}
-#status[data-state="idle"]  .dot{background:#f59e0b}
-#status[data-state="paused"].dot{background:#ef4444}
-
-/* === Progress ring + remain === */
-#ringBtn{
-  all:unset; cursor:pointer; position:relative; width:64px; height:64px; flex:0 0 64px;
-  display:grid; place-items:center; border-radius:50%;
-  background:conic-gradient(var(--c-primary) calc(var(--pct)*1%), rgba(255,255,255,.12) 0);
-}
-#ringBtn::after{
-  content:""; position:absolute; inset:6px; border-radius:50%; background:#171717;
-}
-#remain{
-  position:relative;
-  font-size:20px;       /* 기존 14px → 20px */
-  font-weight:700;      /* 두껍게 */
-  letter-spacing:.5px;
-  min-width:60px;       /* 넓이 조금 늘려주기 */
-  text-align:center;
-  z-index:1;
-}
+// host 만들자마자 추가 (content.js)
+const force = (prop, val) => host.style.setProperty(prop, val, 'important');
+force('background', 'transparent');
+force('border', 'none');
+force('outline', 'none');
+force('box-shadow', 'none');
+force('border-radius', '0');
+force('padding', '0');
+force('margin', '0');
+force('filter', 'none');
 
 
-/* idle badge */
-#idleBadge{ display:none; padding:2px 6px; font-size:11px; border-radius:6px; background:var(--c-danger); color:#fff }
 
-/* buttons */
-/* 버튼 기본 톤 정리 */
-button{ all:unset; padding:8px 12px; border-radius:12px; cursor:pointer; line-height:1; text-align:center; font-weight:600 }
-button.primary{ background:#4f46e5 }   /* 주버튼: 파랑 */
-button.ghost{ background:rgba(255,255,255,.12) }  /* 보조: 중립 */
-button.layout{ background:rgba(255,255,255,.10) } /* 레이아웃: 더 연한 중립 */
-button:disabled{ opacity:.55; cursor:not-allowed }
-button:focus-visible{ outline:2px solid rgba(255,255,255,.56); outline-offset:2px }
-
-#controls{ display:grid; gap:8px }
-#controls .xl{ font-size:18px; padding:12px 16px; width:100% }  /* 토글 크게, 한 줄 전체 */
-.layout-group{ display:grid; grid-template-columns:repeat(3,1fr); gap:6px }
-
-/* menu grid */
-#menuGrid{ display:grid; grid-template-columns:1fr auto; column-gap:12px; row-gap:8px; align-items:center; margin-top:8px }
-#title{ font-size:12px; opacity:.88 }
-#active{ font-size:12px; opacity:.85 }
-
-/* segmented control (modes) */
-#modes{ display:inline-flex; gap:6px }
-#modes button{ padding:6px 10px; background:rgba(255,255,255,.10) }
-#modes button[aria-pressed="true"]{ background:#0ea5e9 }
-
-/* controls */
-#btns{ display:grid; grid-template-columns:repeat(4,auto); gap:6px }
-
-/* history */
-#history{ margin-top:8px; max-width:560px }
-#histHeader{ display:flex; align-items:center; justify-content:space-between; font-size:12px; opacity:.9; margin-bottom:6px }
-#histList{ max-height:160px; overflow:auto; padding:8px; background:rgba(255,255,255,.06); border-radius:10px }
-#histList a{ color:#93c5fd; text-decoration:none }
-.item{ display:flex; align-items:center; gap:8px; font-size:12px; margin-bottom:6px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:540px }
-.item img.fav{ width:14px; height:14px; border-radius:3px; opacity:.9 }
-
-/* handle / misc */
-#handle{ cursor:move; opacity:.7; font-size:12px }
-
-@media (prefers-reduced-motion: reduce){
-  #overlay{ transition:none }
-}
-
-/* === Idle Overlay === */
-#overlay{
-  position: fixed; inset: 0; background: rgba(0,0,0,.6); z-index: 2147483646;
-  display: none; align-items: center; justify-content: center; pointer-events: auto;
-  opacity: 0; transition: opacity .18s ease;
-}
-#overlay[aria-hidden="false"]{ opacity:1 }
-#overlay .box{
-  color:#fff; text-align:center; max-width:520px; padding:20px 24px; border-radius:14px;
-  background: rgba(17,17,17,.85); box-shadow: 0 10px 30px rgba(0,0,0,.35);
-  font: 14px/1.5 ui-sans-serif,system-ui;
-}
-#overlay .title{ font-size:16px; font-weight:700; margin-bottom:6px }
-#overlay .hint{ opacity:.9; font-size:13px }
-</style>
-
-<div id="wrap" class="${compact ? "compact" : "expanded"}">
-  <div class="top">
-    <span id="handle" title="드래그하여 이동">⠿</span>
-    <div id="status" data-state="idle" aria-live="polite"><span class="dot"></span><span class="label">FOCUS</span></div>
-
-    <!-- Progress ring always visible -->
-    <button id="ringBtn" title="메뉴 열기/닫기 (Alt+Shift+M)" aria-expanded="${!compact}">
-      <strong id="remain">--:--</strong>
-    </button>
-
-    <span id="idleBadge" aria-hidden="true">IDLE</span>
-
-    <button id="more" class="ghost" title="메뉴 열기/닫기 (Alt+Shift+M)" aria-controls="panel">⋯</button>
-    <button id="settings" class="ghost" title="옵션 열기">⚙️</button>
-  </div>
-
-  <div id="panel" class="panel" role="region" aria-label="타이머 패널">
-    <div id="menuGrid">
-      <div>
-        <div id="title"></div>
-        <div id="active">활동 00:00 (0%)</div>
-      </div>
-
-      <!-- Mode segmented control -->
-      <div id="modes" role="group" aria-label="모드">
-        <button id="modeFocus" aria-pressed="true" title="집중">Focus</button>
-        <button id="modeShort" aria-pressed="false" title="짧은 휴식">Short</button>
-        <button id="modeLong"  aria-pressed="false" title="긴 휴식">Long</button>
-      </div>
-
-<!-- Controls (간소화) -->
-<div id="controls" style="grid-column:1 / -1">
-  <button id="toggle" class="primary xl" title="시작/일시정지 (Space)">▶</button>
-  <div class="layout-group">
-    <button id="left" class="layout" title="왼쪽 반 (Alt+Shift+Left)">⬅️</button>
-    <button id="max" class="layout" title="최대화 (Alt+Shift+F)">⛶</button>
-    <button id="right" class="layout" title="오른쪽 반 (Alt+Shift+Right)">➡️</button>
-  </div>
-</div>
-    </div>
-
-    <!-- History -->
-    <div id="history">
-      <div id="histHeader">
-        <span>최근 활동</span>
-        <button id="histToggle" class="ghost" aria-expanded="true" title="히스토리 접기/펼치기">접기</button>
-      </div>
-      <div id="histList" role="list"></div>
-    </div>
-  </div> <!-- /panel -->
-</div> <!-- /wrap -->
-
-<!-- Idle Overlay -->
-<div id="overlay" aria-hidden="true">
-  <div class="box">
-    <div class="title">집중 시간 멈춤</div>
-    <div>최근 2분간 키보드/마우스/스크롤 활동이 없어 화면을 잠시 가렸어요.</div>
-    <div class="hint">마우스 움직임, 키 입력, 스크롤 등 활동이 감지되면 자동으로 해제됩니다.</div>
-  </div>
-</div>
-`;
-
+  host.id = 'ct-hud-host';
+  Object.assign(host.style, {
+    position:'fixed', top:'16px', left:'50%', transform:'translateX(-50%)',
+    zIndex: 2147483000
+  });
+  const shadow = host.attachShadow({mode:'open'});
   document.documentElement.appendChild(host);
 
-  // ✅ 교체 후
-  const $ = (s) => shadow.querySelector(s);
+  const wrap = document.createElement('div');
+  wrap.className = 'wrap';
 
-  // 그다음에
-  const wrap = $("#wrap"),
-    toggleBtn = $("#toggle"),
-    statusEl = $("#status"),
-    remainEl = $("#remain"),
-    ringBtn = $("#ringBtn"),
-    histToggle = $("#histToggle");
+  const style = document.createElement('style');
+  style.textContent = `
+    :host { all: initial; contain: layout paint style; }
+    .row { display:flex; align-items:center; gap:10px; padding:8px 10px;
+           background: rgba(12,12,14,.88); color:#fff; font: 13px/1.2 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+           border-radius:12px; box-shadow: 0 2px 16px rgba(0,0,0,.35); backdrop-filter: saturate(1.2) blur(6px); }
+    .pill { padding:4px 8px; border-radius:8px; background:#2b2f36; font-weight:700; white-space:nowrap; }
+    .small { opacity:.85; }
+    .btn { all: unset; display:inline-flex; align-items:center; justify-content:center;
+           padding:6px 9px; border-radius:8px; background:#2b2f36; cursor:pointer; user-select:none; }
+    .btn:hover { background:#3b414b; }
+    .btn svg { width:16px; height:16px; display:block; }
+    .panel { position:fixed; top:64px; right:16px; max-width:460px; max-height:60vh; overflow:auto; background:rgba(12,12,14,.96); color:#fff; border-radius:12px; box-shadow:0 8px 32px rgba(0,0,0,.45); padding:12px; display:none; z-index:2147483001; }
+    .grid { display:grid; grid-template-columns:1fr auto auto; gap:8px 12px; }
+    .name { opacity:.9; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
+    .num { font-weight:700; }
+  `;
 
-  const idleBadge = $("#idleBadge"),
-    handle = $("#handle");
-  const btnLeft = $("#left"),
-    btnRight = $("#right"),
-    btnMax = $("#max"),
-    btnMore = $("#more"),
-    btnSettings = $("#settings");
-  const titleEl = $("#title"),
-    histList = $("#histList");
+  const row = document.createElement('div');
+  row.className = 'row';
 
-  const pos = await getSavedPos();
-  if (pos && Number.isFinite(pos.left) && Number.isFinite(pos.top)) {
-    wrap.style.right = "auto";
-    wrap.style.left = `${pos.left}px`;
-    wrap.style.top = `${pos.top}px`;
+  function pill(label){ const s=document.createElement('span'); s.className='pill'; s.textContent=label; return s; }
+  const aEl = pill('총: 00:00:00');
+  const bEl = pill('집중: 00:00:00');
+  const small = document.createElement('span'); small.className='small';
+
+  function icon(name){
+    const ns='http://www.w3.org/2000/svg';
+    const svg=document.createElementNS(ns,'svg');
+    svg.setAttribute('viewBox','0 0 24 24');
+    const path=document.createElementNS(ns,'path');
+    path.setAttribute('fill','currentColor');
+    if (name==='left')  path.setAttribute('d','M14 7l-5 5 5 5V7z');
+    if (name==='right') path.setAttribute('d','M10 17l5-5-5-5v10z');
+    if (name==='max')   path.setAttribute('d','M4 6h16v12H4z M6 8v8h12V8z');
+    svg.appendChild(path); return svg;
   }
-  const guessTitle = () => {
-    // 1) 사이트별 커스텀(있으면 최우선) — 옵션화 안 되어 있으면 하드코딩도 OK
-    const siteSel = document.querySelector(
-      // 필요한 셀렉터를 쉼표로 추가
-      "h1,h2,.title,.lecture-title,.problem-title,.lesson-title,.problem__title, .panel-title"
-    );
-    if (siteSel) return (siteSel.textContent || "").trim().slice(0, 80);
-
-    // 2) 메타 og:title
-    const og = document.querySelector('meta[property="og:title"]')?.content;
-    if (og) return og.trim().slice(0, 80);
-
-    // 3) <title>
-    if (document.title) return document.title.trim().slice(0, 80);
-
-    return "";
-  };
-  titleEl.textContent = guessTitle();
-
-  let dragging = false,
-    startX = 0,
-    startY = 0,
-    baseLeft = 0,
-    baseTop = 0;
-  function beginDrag(e) {
-    dragging = true;
-    const r = wrap.getBoundingClientRect();
-    baseLeft = r.left;
-    baseTop = r.top;
-    startX = e.clientX;
-    startY = e.clientY;
-    wrap.setPointerCapture?.(e.pointerId);
-    e.preventDefault();
+  function btnIcon(name, tip, handler){
+    const b=document.createElement('button'); b.className='btn'; b.title=tip||'';
+    b.appendChild(icon(name)); b.addEventListener('click', handler); return b;
   }
-  function onDrag(e) {
-    if (!dragging) return;
-    const dx = e.clientX - startX,
-      dy = e.clientY - startY;
-    const left = Math.max(0, Math.min(window.innerWidth - 40, baseLeft + dx));
-    const top = Math.max(0, Math.min(window.innerHeight - 40, baseTop + dy));
-    wrap.style.right = "auto";
-    wrap.style.left = `${left}px`;
-    wrap.style.top = `${top}px`;
+  const btnLeft  = btnIcon('left','창 왼쪽',  ()=> safeSendMessage({type:'layout:left'}));
+  const btnMax   = btnIcon('max', '최대화',   ()=> safeSendMessage({type:'layout:maximize'}));
+  const btnRight = btnIcon('right','창 오른쪽',()=> safeSendMessage({type:'layout:right'}));
+
+  const btnExpand = document.createElement('button');
+  btnExpand.className='btn'; btnExpand.title='문제별 기록 보기'; btnExpand.textContent='▾';
+
+  row.append(aEl, bEl, small, btnLeft, btnMax, btnRight, btnExpand);
+  wrap.appendChild(row);
+  shadow.append(style, wrap);
+
+  function applyMode(){
+    MODE = getPageMode();
+    btnExpand.style.display = (MODE === 'list') ? '' : 'none';
+    small.style.display     = (MODE === 'list') ? '' : 'none';
   }
-  async function endDrag(e) {
-    if (!dragging) return;
-    dragging = false;
-    wrap.releasePointerCapture?.(e.pointerId);
-    const r = wrap.getBoundingClientRect();
-    await savePos({ left: r.left, top: r.top });
+  applyMode();
+
+  // Drag (host element is in main DOM)
+  let dragging=false, dx=0, dy=0;
+  function clamp(left, top){
+    const r=host.getBoundingClientRect(); const W=innerWidth, H=innerHeight, M=8;
+    return { left: Math.max(M, Math.min(W - r.width  - M, left)),
+             top:  Math.max(M, Math.min(H - r.height - M, top )) };
   }
-  [handle, wrap].forEach((el) =>
-    el.addEventListener("pointerdown", (e) => {
-      const tag = (e.target?.tagName || "").toLowerCase();
-      if (tag === "button" || e.button !== 0) return;
-      beginDrag(e);
-    })
-  );
-  window.addEventListener("pointermove", onDrag, { passive: true });
-  window.addEventListener("pointerup", endDrag, { passive: true });
-
-  const activity = () => {
-    lastActiveAt = Date.now();
-  };
-  [
-    "mousemove",
-    "mousedown",
-    "wheel",
-    "keydown",
-    "touchstart",
-    "pointerdown",
-    "scroll",
-  ].forEach((evt) => window.addEventListener(evt, activity, { passive: true }));
-
-  // startBtn.onclick = () =>
-  //   chrome.runtime.sendMessage({
-  //     type: "pomo:start",
-  //     problemKey,
-  //     focusMin: defaultFocusMin(),
-  //     breakMin: defaultBreakMin(),
-  //   });
-  const updateToggleButtonUI = () => {
-    const running = state?.status === "focus";
-    const underCooldown = cooldownRemaining > 0;
-
-    toggleBtn.disabled = running && underCooldown;
-    if (running) {
-      if (underCooldown) {
-        const secs = Math.ceil(cooldownRemaining / 1000);
-        toggleBtn.textContent = `⏸ (${secs}s)`;
-        toggleBtn.title = `시작 후 5분은 일시정지할 수 없어요. 남은 ${secs}초`;
-      } else {
-        toggleBtn.textContent = "⏸";
-        toggleBtn.title = "일시정지";
+  (async ()=>{
+    try{
+      const saved = await chrome.storage.local.get(HOSTPOS);
+      if (saved && saved[HOSTPOS]){
+        const p=saved[HOSTPOS];
+        host.style.left=p.left+'px'; host.style.top=p.top+'px'; host.style.transform='translateX(0)';
       }
+    }catch(_){}
+  })();
+  host.addEventListener('mousedown', (e)=>{
+    dragging=true; host.style.cursor='grabbing';
+    const r=host.getBoundingClientRect();
+    dx=e.clientX-r.left; dy=e.clientY-r.top; e.preventDefault();
+  });
+  addEventListener('mousemove', (e)=>{
+    if(!dragging) return;
+    const p=clamp(e.clientX-dx, e.clientY-dy);
+    host.style.left=p.left+'px'; host.style.top=p.top+'px'; host.style.transform='translateX(0)';
+  });
+  addEventListener('mouseup', ()=>{
+    if(!dragging) return; dragging=false; host.style.cursor='';
+    const r=host.getBoundingClientRect(); const pos={left:Math.round(r.left), top:Math.round(r.top)};
+    try{ chrome.storage.local.set({[HOSTPOS]:pos}); }catch(_){}
+  });
+
+  // Expand panel (Shadow DOM)
+  const panel = document.createElement('div');
+  panel.className='panel';
+  const title = document.createElement('div'); title.textContent='문제별 누적 (전체)'; title.style.cssText='font-weight:700;margin-bottom:8px';
+  const grid = document.createElement('div'); grid.className='grid';
+  panel.append(title, grid);
+  shadow.append(panel);
+
+  function renderPanel(){
+    grid.innerHTML='';
+    const prefix = `ct.acc.${location.host}:`;
+    const rows = [];
+    for (let i=0;i<localStorage.length;i++){
+      const k = localStorage.key(i);
+      if (k && k.startsWith(prefix)){
+        try {
+          const v = JSON.parse(localStorage.getItem(k) || '{}');
+          const label = k.substring(prefix.length);
+          rows.push({label, totalMs:v.totalMs||0, focusMs:v.focusMs||0});
+        } catch(_) {}
+      }
+    }
+    rows.sort((a,b)=> b.totalMs - a.totalMs);
+    rows.slice(0,300).forEach(r=>{
+      const n=document.createElement('div'); n.className='name'; n.textContent=r.label;
+      const t=document.createElement('div'); t.className='num';  t.textContent=fmt(r.totalMs);
+      const f=document.createElement('div'); f.className='num';  f.textContent=fmt(r.focusMs);
+      grid.append(n,t,f);
+    });
+  }
+  btnExpand.addEventListener('click', ()=>{
+    if (panel.style.display==='none'){ renderPanel(); panel.style.display='block'; }
+    else panel.style.display='none';
+  });
+
+  // ---------- Activity tracking ----------
+  const markKey=()=>{ S.lastKeyAt=Date.now(); };
+  const markMouse=()=>{ S.lastMouseAt=Date.now(); };
+  ['keydown','keyup'].forEach(ev=>addEventListener(ev,markKey,{passive:true}));
+  ['mousemove','mousedown','wheel','touchstart','touchmove'].forEach(ev=>addEventListener(ev,markMouse,{passive:true}));
+  document.addEventListener('visibilitychange', ()=>{ if (document.hidden){ S.lastKeyAt=0; S.lastMouseAt=0; } });
+
+  // ---------- URL change detection ----------
+  const _push = history.pushState, _replace = history.replaceState;
+  function onUrlMaybeChanged(){
+    const newKey = getProblemKey();
+    const newMode = getPageMode();
+    if (newKey !== CURRENT_KEY){
+      saveProblemAcc(CURRENT_KEY, { totalMs: S.totalMs, focusMs: S.focusMs });
+      CURRENT_KEY = newKey;
+      const acc = loadProblemAcc(CURRENT_KEY);
+      S.totalMs = acc.totalMs||0; S.focusMs = acc.focusMs||0;
+    }
+    if (newMode !== MODE){
+      MODE = newMode; applyMode();
+      if (MODE === 'list'){
+        const d = loadTodayTotals();
+        S.todayTotal = d.totalMs||0; S.todayFocus = d.focusMs||0;
+      }
+    }
+  }
+  history.pushState = function(...args){ _push.apply(this,args); setTimeout(onUrlMaybeChanged,0); };
+  history.replaceState = function(...args){ _replace.apply(this,args); setTimeout(onUrlMaybeChanged,0); };
+  addEventListener('popstate', onUrlMaybeChanged);
+  addEventListener('hashchange', onUrlMaybeChanged);
+  setInterval(onUrlMaybeChanged, 1000);
+
+  // ---------- Main loop ----------
+  function loop(){
+    const now = Date.now(); const dt = now - S.lastTick; S.lastTick = now;
+    const effectiveRun = S.running && (getPageMode() === 'problem');
+
+    if (effectiveRun){
+      S.totalMs += dt;
+      const bothRecent = (now - S.lastKeyAt < TWO_MIN) && (now - S.lastMouseAt < TWO_MIN) && !document.hidden;
+      if (bothRecent) S.focusMs += dt;
+
+      if (S.day !== todayStr()){ S.day = todayStr(); S.todayTotal = 0; S.todayFocus = 0; }
+      S.todayTotal += dt; if (bothRecent) S.todayFocus += dt;
+
+      if (!bothRecent && (now % 15000 < dt)) safeSendMessage({ type: 'notify:idle' });
+    }
+
+    if (getPageMode() === 'problem'){
+      aEl.textContent = '총: ' + fmt(S.totalMs);
+      bEl.textContent = '집중: ' + fmt(S.focusMs);
+      small.textContent = '';
     } else {
-      toggleBtn.textContent = "▶";
-      toggleBtn.title = "시작";
+      const d = loadTodayTotals();
+      aEl.textContent = '오늘 총: ' + fmt(d.totalMs||0);
+      bEl.textContent = '오늘 집중: ' + fmt(d.focusMs||0);
+      small.textContent = '';
     }
-  };
 
-  // start(▶)는 상태별로 “재개/새로시작”을 자동 처리(sw.js가 판단)
-  // ✅ 추가: ▶/⏸ 토글
-  // 시작/일시정지 토글
-  toggleBtn.onclick = () => {
-    if (state?.status === "focus") {
-      // 실행 중 → (쿨다운이 0이면) 일시정지
-      if (cooldownRemaining > 0) return; // UI에서 disabled 처리도 함께 함
-      chrome.runtime.sendMessage({ type: "pomo:pause", problemKey }, (res) => {
-        if (!res?.ok) {
-          if (res?.error === "cooldown") {
-            const secs = Math.ceil((res.cooldownRemaining || 0) / 1000);
-            cooldownRemaining = res.cooldownRemaining || 0;
-            updateToggleButtonUI();
-            startCooldownTicker(updateToggleButtonUI);
-            showUndo(
-              shadow,
-              `시작 후 5분은 일시정지할 수 없어요. 남은 ${secs}초`,
-              null
-            );
-          }
-        }
+    if (now % 3000 < dt){
+      saveProblemAcc(CURRENT_KEY, { totalMs: S.totalMs, focusMs: S.focusMs });
+      const d = loadTodayTotals();
+      if (getPageMode() === 'problem'){ d.totalMs = S.todayTotal; d.focusMs = S.todayFocus; }
+      saveTodayTotals(d);
+    }
+
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+
+  // listen to SW commands if available
+  if (hasExt()) {
+    try {
+      chrome.runtime.onMessage.addListener((msg)=>{
+        if (!msg || !msg.type) return;
+        if (msg.type === 'layout:left')  btnLeft.click();
+        if (msg.type === 'layout:right') btnRight.click();
+        if (msg.type === 'layout:maximize') btnMax.click();
       });
-      return;
-    }
-
-    // idle/break → 시작
-    chrome.runtime.sendMessage(
-      {
-        type: "pomo:start",
-        problemKey,
-        focusMin: defaultFocusMin(),
-        breakMin: defaultBreakMin(),
-      },
-      (res) => {
-        if (res?.error === "too-many-pauses") {
-          showUndo(shadow, "일시정지 횟수를 초과했습니다.", null);
-        } else if (res?.error === "min-segment-not-met") {
-          showUndo(
-            shadow,
-            "집중 시작 후 5분이 지나야 일시정지/재개가 가능합니다.",
-            null
-          );
-        }
-        // 쿨다운 갱신
-        chrome.runtime.sendMessage(
-          { type: "pomo:getState", problemKey },
-          (r2) => {
-            if (r2?.ok) {
-              cooldownRemaining = r2.cooldownRemaining || 0;
-              updateToggleButtonUI();
-              startCooldownTicker(updateToggleButtonUI);
-            }
-          }
-        );
-      }
-    );
-  };
-
-  btnLeft.onclick = () => chrome.runtime.sendMessage({ type: "layout:left" });
-  btnRight.onclick = () => chrome.runtime.sendMessage({ type: "layout:right" });
-  btnMax.onclick = () =>
-    chrome.runtime.sendMessage({ type: "layout:maximize" });
-  const toggle = () => {
-    const exp = !wrap.classList.contains("expanded");
-    wrap.classList.toggle("expanded", exp);
-    wrap.classList.toggle("compact", !exp);
-    setUI({ expanded: exp });
-  };
-  btnMore.onclick = toggle;
-  ringBtn.addEventListener("click", toggle);
-
-  // remainEl.addEventListener("click", toggle);
-  if (btnSettings)
-    btnSettings.onclick = () => {
-      console.log("[pomo] settings click → ask SW to open options");
-      chrome.runtime.sendMessage({ type: "openOptions" }, (res) => {
-        console.log(
-          "[pomo] openOptions response:",
-          res,
-          "lastError=",
-          chrome.runtime.lastError
-        );
-        // SW에서 응답이 없거나 에러면 폴백으로 직접 열기
-        if (!res?.ok) {
-          const url = chrome.runtime.getURL("options.html");
-          try {
-            window.open(url, "_blank", "noopener");
-          } catch (e) {}
-        }
-      });
-    };
-
-  chrome.runtime.onMessage.addListener((msg) => {
-    if (msg.type === "pomo:togglePanel") toggle();
-    if (msg.type === "pomo:markSolved") manualMark();
-  });
-  let histCollapsed = false;
-
-  async function refreshHistory() {
-    const items = await getHistory();
-    const maxShow = OPTS.history?.maxShow ?? 12;
-    const list = histCollapsed ? [] : items.slice(0, maxShow);
-
-    histList.innerHTML = list
-      .map((it) => {
-        const d = new Date(it.at);
-        const t = d.toLocaleString();
-        const title = it.title ? ` - ${it.title}` : "";
-        const url = `${location.protocol}//${it.host}${it.path}`;
-        const auto = it.auto ? " (auto)" : "";
-        const fav = `https://www.google.com/s2/favicons?domain=${it.host}&sz=32`;
-        return `
-      <div class="item" role="listitem">
-        <img class="fav" src="${fav}" alt="">
-        <a href="${url}" target="_blank" rel="noopener">${it.host}${it.path}</a>${title} — ${t}${auto}
-      </div>`;
-      })
-      .join("");
-
-    histToggle.textContent = histCollapsed ? "펼치기" : "접기";
-    histToggle.setAttribute("aria-expanded", String(!histCollapsed));
+    } catch(_){}
   }
-
-  histToggle.addEventListener("click", () => {
-    histCollapsed = !histCollapsed;
-    refreshHistory();
-  });
-
-  // btnMark.onclick = () => manualMark();
-  // function manualMark() {
-  //   const { host, path } = urlInfo();
-  //   const title = guessTitle();
-  //   const at = Date.now();
-  //   const item = { key: problemKey, title, at, auto: false, host, path };
-  //   pushHistory(item).then(() => {
-  //     refreshHistory();
-  //     showUndo(shadow, "기록됨 — 되돌리기", () =>
-  //       removeHistoryByAt(at).then(refreshHistory)
-  //     );
-  //   });
-  // }
-
-  // Selector-based auto-detect
-  function getRuleForHost() {
-    const rules = (OPTS.detect && OPTS.detect.rules) || [];
-    for (const r of rules) {
-      if (!r.host) continue;
-      if (r.host.startsWith("*.")) {
-        const suf = r.host.slice(1);
-        if (location.host.endsWith(suf)) return r;
-      } else if (r.host === location.host) {
-        return r;
-      }
-    }
-    return null;
-  }
-  function buildKeywordRegex(rule) {
-    const list =
-      rule && Array.isArray(rule.keywords) && rule.keywords.length
-        ? rule.keywords
-        : [
-            "맞았습니다",
-            "정답입니다",
-            "성공",
-            "통과",
-            "Accepted",
-            "Correct",
-            "정확한풀이",
-          ];
-    const esc = list.map((s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
-    return new RegExp(esc.join("|"), "i");
-  }
-  let selectionTargets = [];
-  function refreshTargets(rule) {
-    selectionTargets = [];
-    const sels = rule && Array.isArray(rule.selectors) ? rule.selectors : [];
-    if (!sels.length) return;
-    sels.forEach((sel) =>
-      document.querySelectorAll(sel).forEach((el) => selectionTargets.push(el))
-    );
-  }
-  function withinTargets(el) {
-    if (!selectionTargets.length) return true;
-    for (const t of selectionTargets) if (t.contains(el)) return true;
-    return false;
-  }
-  let currentRule = getRuleForHost();
-  let kwRe = buildKeywordRegex(currentRule);
-  refreshTargets(currentRule);
-  const refreshTimer = setInterval(() => refreshTargets(currentRule), 3000);
-
-  const mo = new MutationObserver(async (muts) => {
-    for (const m of muts) {
-      const txt =
-        (m.target?.textContent || "") +
-        (m.addedNodes
-          ? Array.from(m.addedNodes)
-              .map((n) => n.textContent || "")
-              .join("")
-          : "");
-      if (!txt) continue;
-      if (!withinTargets(m.target)) continue;
-      if (kwRe.test(txt)) {
-        const { host, path } = urlInfo();
-        const at = Date.now();
-        await pushHistory({
-          key: problemKey,
-          title: guessTitle(),
-          at,
-          auto: true,
-          host,
-          path,
-        });
-        await refreshHistory();
-        mo.disconnect();
-        clearInterval(refreshTimer);
-        break;
-      }
-    }
-  });
-  mo.observe(document.documentElement, {
-    subtree: true,
-    childList: true,
-    characterData: true,
-  });
-
-  // === New: Pause button UI updater respecting cooldown
-  // const updatePauseButtonUI = () => {
-  //   const inFocus = state?.status === "focus";
-  //   const underCooldown = cooldownRemaining > 0;
-  //   stopBtn.disabled = !inFocus || underCooldown;
-  //   if (underCooldown) {
-  //     const secs = Math.ceil(cooldownRemaining / 1000);
-  //     stopBtn.textContent = `⏸ (${secs}s)`;
-  //     stopBtn.title = `시작 후 5분은 일시정지할 수 없어요. 남은 시간: ${secs}초`;
-  //   } else {
-  //     stopBtn.textContent = inFocus ? "⏸" : "■";
-  //     stopBtn.title = inFocus ? "일시정지" : "정지";
-  //   }
-  // };
-
-  // Auto-start + initial state load
-  chrome.runtime.sendMessage({ type: "pomo:get", problemKey }, async (s) => {
-    if (chrome.runtime.lastError) return;
-    state = s || { status: "idle" };
-    prevState = null;
-    if (state.status === "idle" && pageKind() === "problem") {
-      const derived = deriveFocusMinutesByDifficulty();
-      const focusMin = location.host.includes("localhost")
-        ? 0.1
-        : derived || 15;
-      chrome.runtime.sendMessage(
-        {
-          type: "pomo:start",
-          problemKey,
-          focusMin,
-          breakMin: defaultBreakMin(),
-        },
-        () => {
-          chrome.runtime.sendMessage(
-            { type: "pomo:getState", problemKey },
-            (res) => {
-              if (res?.ok) {
-                cooldownRemaining = res.cooldownRemaining || 0;
-                updateToggleButtonUI();
-                startCooldownTicker(updateToggleButtonUI);
-              }
-            }
-          );
-        }
-      );
-    } else {
-      chrome.runtime.sendMessage(
-        { type: "pomo:getState", problemKey },
-        (res) => {
-          if (res?.ok) {
-            cooldownRemaining = res.cooldownRemaining || 0;
-            updateToggleButtonUI();
-            startCooldownTicker(updateToggleButtonUI);
-          }
-        }
-      );
-    }
-    render();
-    startHeartbeat(shadow);
-  });
-
-  // Broadcast → refresh state + cooldown
-  chrome.runtime.onMessage.addListener((msg) => {
-    if (msg.type === "pomo:update" && msg.problemKey === problemKey) {
-      chrome.runtime.sendMessage(
-        { type: "pomo:get", problemKey },
-        async (s) => {
-          if (chrome.runtime.lastError) return;
-          prevState = state;
-          state = s || { status: "idle" };
-          // ask SW for current cooldownRemaining
-          chrome.runtime.sendMessage(
-            { type: "pomo:getState", problemKey },
-            (res) => {
-              if (res?.ok) {
-                cooldownRemaining = res.cooldownRemaining || 0;
-                updateToggleButtonUI();
-                startCooldownTicker(updateToggleButtonUI);
-              }
-            }
-          );
-          // (Keep your history confirm-on-break logic)
-          if (
-            prevState &&
-            prevState.status === "focus" &&
-            state.status === "break"
-          ) {
-            const items = await getHistory();
-            const hadSolved = items.some(
-              (it) =>
-                it.key === problemKey &&
-                it.at >= prevState.startedAt &&
-                it.at <= Date.now()
-            );
-            if (!hadSolved) {
-              showConfirm(shadow, "풀이 완료로 기록할까요?", () => {
-                const { host, path } = urlInfo();
-                const at = Date.now();
-                const item = {
-                  key: problemKey,
-                  title: guessTitle(),
-                  at,
-                  auto: false,
-                  host,
-                  path,
-                };
-                pushHistory(item).then(() => {
-                  refreshHistory();
-                  showUndo(shadow, "기록됨 — 되돌리기", () =>
-                    removeHistoryByAt(at).then(refreshHistory)
-                  );
-                });
-              });
-            }
-          }
-          render();
-        }
-      );
-    }
-  });
-
-  function render() {
-    const labelEl = statusEl.querySelector(".label");
-
-    const updateRemainAndProgress = () => {
-      let remainMs = 0,
-        totalMs = 0;
-      const now = Date.now();
-
-      if (state.status === "focus" || state.status === "break") {
-        remainMs = Math.max(0, (state.endAt || 0) - now);
-        totalMs = Math.max(1, (state.endAt || 0) - (state.startedAt || now));
-      }
-
-      // 남은 시간 mm:ss
-      if (remainMs > 0) {
-        const mm = String(Math.floor(remainMs / 60000)).padStart(2, "0");
-        const ss = String(Math.floor((remainMs % 60000) / 1000)).padStart(
-          2,
-          "0"
-        );
-        remainEl.textContent = `${mm}:${ss}`;
-      } else {
-        remainEl.textContent = "--:--";
-      }
-
-      // 원형 링 진행률
-      const pct = totalMs ? Math.max(0, Math.min(1, remainMs / totalMs)) : 0;
-      wrap.style.setProperty("--pct", (pct * 100).toFixed(2));
-    };
-
-    // 라벨/상태 색
-    const label =
-      state.status === "focus"
-        ? "FOCUS"
-        : state.status === "break"
-        ? "BREAK"
-        : "IDLE";
-    labelEl.textContent = label;
-    statusEl.dataset.state = state.status || "idle";
-
-    updateRemainAndProgress();
-    updateToggleButtonUI();
-
-    if (rafId) cancelAnimationFrame(rafId);
-    const loop = () => {
-      updateRemainAndProgress();
-      updateToggleButtonUI();
-      rafId = requestAnimationFrame(loop);
-    };
-    loop();
-  }
-
-  function startHeartbeat(shadow) {
-    lastBeat = Date.now();
-    if (heartbeatTimer) clearInterval(heartbeatTimer);
-    heartbeatTimer = setInterval(() => {
-      const now = Date.now();
-      const dt = now - lastBeat;
-      lastBeat = now;
-      const running = state.status === "focus";
-      const isIdle = document.hidden || now - lastActiveAt >= idleThreshold;
-      const idleBadge = shadow.querySelector("#idleBadge");
-      const overlay = shadow.getElementById("overlay");
-
-      idleBadge.style.display = running && isIdle ? "inline-block" : "none";
-      if (overlay) {
-        const show = running && isIdle;
-        document.documentElement.style.overflow = show ? "hidden" : "";
-        overlay.style.display = show ? "flex" : "none";
-        overlay.setAttribute("aria-hidden", show ? "false" : "true");
-      }
-      if (running && !isIdle) activeMs += dt;
-      let percent = 0,
-        elapsed = 0;
-      if (state.status === "focus") {
-        elapsed = Math.max(1, now - state.startedAt);
-        percent = Math.min(100, Math.round((activeMs / elapsed) * 100));
-      }
-      const mm = String(Math.floor(activeMs / 60000)).padStart(2, "0");
-      const ss = String(Math.floor((activeMs % 60000) / 1000)).padStart(2, "0");
-      const activeEl = shadow.querySelector("#active");
-      if (activeEl) activeEl.textContent = `활동 ${mm}:${ss} (${percent}%)`;
-    }, 1000);
-  }
-}
-
-function unmountUI() {
-  const host = document.getElementById("pomo-host");
-  if (host) host.remove();
-  mounted = false;
-  problemKey = null;
-  if (rafId) cancelAnimationFrame(rafId);
-  if (heartbeatTimer) {
-    clearInterval(heartbeatTimer);
-    heartbeatTimer = null;
-  }
-}
-
-function tryMount() {
-  const key = getProblemKey();
-  if (!mounted && key) {
-    mountUI(key);
-  } else if (mounted && !key) {
-    unmountUI();
-  } else if (mounted && key && key !== problemKey) {
-    unmountUI();
-    mountUI(key);
-  }
-}
-(function () {
-  const p = history.pushState;
-  const r = history.replaceState;
-  const on = () => setTimeout(tryMount, 0);
-  history.pushState = function (...a) {
-    const o = p.apply(this, a);
-    on();
-    return o;
-  };
-  history.replaceState = function (...a) {
-    const o = r.apply(this, a);
-    on();
-    return o;
-  };
-  window.addEventListener("popstate", on);
-  window.addEventListener("hashchange", on);
-  setInterval(() => {
-    if (location.href !== lastHref) {
-      lastHref = location.href;
-      on();
-    }
-  }, 800);
 })();
-document.addEventListener("DOMContentLoaded", tryMount);
-tryMount();
-
-function defaultFocusMin() {
-  return location.host.includes("localhost") ? 0.1 : 25;
-}
-function defaultBreakMin() {
-  return location.host.includes("localhost") ? 0.1 : 5;
-}

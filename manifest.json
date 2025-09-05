@@ -1,73 +1,63 @@
 {
   "manifest_version": 3,
-  "name": "Study Pomodoro (Options + Selector Rules)",
-  "version": "0.4.6",
-  "description": "Pomodoro HUD for problem sites with draggable timer, activity tracking, history, window snap.",
-
+  "name": "Coding Timer (Domain Aware + Shadow HUD)",
+  "version": "2025.0905.6",
+  "description": "Problem-level stopwatch + focus timer with domain-aware HUD. Shadow DOM isolates styles; safe messaging guards.",
   "permissions": [
-    "storage",
-    "alarms",
-    "notifications",
     "tabs",
-    "windows",
-    "system.display"
+    "storage",
+    "scripting",
+    "activeTab",
+    "notifications",
+    "windows"
   ],
-
+  "host_permissions": [
+    "http://edu.doingcoding.com/*",
+    "https://edu.doingcoding.com/*",
+    "https://www.acmicpc.net/*",
+    "https://acmicpc.net/*",
+    "https://edu.goorm.io/*",
+    "https://school.programmers.co.kr/learn/challenges*",
+    "https://school.programmers.co.kr/learn/courses/*/lessons/*"
+  ],
   "background": {
-    "service_worker": "sw.js",
-    "type": "module"
+    "service_worker": "sw.js"
   },
-
-  "icons": {
-    "16": "icon16.png",
-    "32": "icon32.png",
-    "48": "icon48.png",
-    "128": "icon128.png"
-  },
-
-  "options_page": "options.html",
-
   "content_scripts": [
     {
       "matches": [
-        "*://*.acmicpc.net/*",
-        "*://programmers.co.kr/*",
-        "*://school.programmers.co.kr/*",
-        "*://edu.doingcoding.com/*",
-        "http://localhost:5173/*",
-        "*://edu.goorm.io/learn/lecture/*"
+        "http://edu.doingcoding.com/*",
+        "https://edu.doingcoding.com/*",
+        "https://www.acmicpc.net/*",
+        "https://acmicpc.net/*",
+        "https://edu.goorm.io/*",
+        "https://school.programmers.co.kr/learn/challenges*",
+        "https://school.programmers.co.kr/learn/courses/*/lessons/*"
       ],
-      "js": [ "content.js" ],
-      "run_at": "document_idle",
-      "all_frames": true
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
     }
   ],
-
-  "host_permissions": [
-    "*://*.acmicpc.net/*",
-    "*://programmers.co.kr/*",
-    "*://school.programmers.co.kr/*",
-    "*://edu.doingcoding.com/*",
-    "http://localhost:5173/*",
-    "*://edu.goorm.io/learn/lecture/*"
-  ],
-
   "commands": {
     "layout-left": {
-      "suggested_key": { "default": "Alt+Shift+Left" },
-      "description": "Snap window to left half"
+      "suggested_key": {
+        "default": "Alt+Shift+Left"
+      },
+      "description": "Snap left"
     },
     "layout-right": {
-      "suggested_key": { "default": "Alt+Shift+Right" },
-      "description": "Snap window to right half"
+      "suggested_key": {
+        "default": "Alt+Shift+Right"
+      },
+      "description": "Snap right"
     },
     "layout-maximize": {
-      "suggested_key": { "default": "Alt+Shift+F" },
-      "description": "Maximize window"
-    },
-    "toggle-panel": {
-      "suggested_key": { "default": "Alt+Shift+M" },
-      "description": "Toggle compact/expanded HUD"
+      "suggested_key": {
+        "default": "Alt+Shift+F"
+      },
+      "description": "Maximize"
     }
   }
 }
